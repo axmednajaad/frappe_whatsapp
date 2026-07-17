@@ -11,6 +11,7 @@ from frappe.integrations.utils import make_post_request, make_request
 from frappe.desk.form.utils import get_pdf_link
 
 from frappe_whatsapp.utils import get_whatsapp_account
+from frappe_whatsapp.utils.template_parameters import extract_named_parameter_names
 
 class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-committing-other-method -- get_settings() sets self._token/_url/_version/_business_id/_app_id/_headers as in-memory scratch for the outbound Meta HTTP call; they are not DocType fields and must not be persisted
     """Create whatsapp template."""
@@ -120,6 +121,76 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
         return frappe.get_doc("File", {"file_url": file_url}).get_content()
 
 
+    def _build_body_component(self):
+        """Build the BODY component, using Meta named-parameter example format
+        when the template body uses named placeholders like {{customer_name}}."""
+        named_params = extract_named_parameter_names(self.template)
+        body = {
+            "type": "BODY",
+            "text": self.template,
+        }
+        if self.sample_values:
+            samples = [s.strip() for s in self.sample_values.split(",")]
+            if named_params:
+                body["example"] = {
+                    "body_text_named_params": [
+                        {
+                            "param_name": name,
+                            "example": samples[idx] if idx < len(samples) else "",
+                        }
+                        for idx, name in enumerate(named_params)
+                    ]
+                }
+            else:
+                body["example"] = {"body_text": [samples]}
+
+        return body, bool(named_params)
+
+    def _build_button_component(self):
+        """Build the BUTTONS component, or None when the template has no buttons."""
+        if not self.buttons:
+            return None
+
+        button_block = {"type": "BUTTONS", "buttons": []}
+        for btn in self.buttons:
+            b = {"type": btn.button_type, "text": btn.button_label}
+
+            if btn.button_type == "Visit Website":
+                b["type"] = "URL"
+                b["url"] = btn.website_url
+                if btn.url_type == "Dynamic" and btn.example_url:
+                    b["example"] = btn.example_url.split(",")
+            elif btn.button_type == "Call Phone":
+                b["type"] = "PHONE_NUMBER"
+                b["phone_number"] = btn.phone_number
+            elif btn.button_type == "Quick Reply":
+                b["type"] = "QUICK_REPLY"
+            elif btn.button_type == "Multi-Product Message":
+                b["type"] = "MPM"
+            elif btn.button_type == "Catalog":
+                b["type"] = "CATALOG"
+
+            button_block["buttons"].append(b)
+
+        return button_block
+
+    def _build_components(self):
+        """Assemble Meta template components. Returns (components, uses_named)."""
+        body, uses_named = self._build_body_component()
+        components = [body]
+
+        if self.header_type:
+            components.append(self.get_header())
+
+        if self.footer:
+            components.append({"type": "FOOTER", "text": self.footer})
+
+        button_block = self._build_button_component()
+        if button_block:
+            components.append(button_block)
+
+        return components, uses_named
+
     def after_insert(self):  # nosemgrep: frappe-modifying-but-not-committing -- self.actual_name/id/status are persisted via self.db_update() after the Meta round-trip; the static check can't trace through the API call
         # actual_name / id / status are persisted via self.db_update() below
         # after the Meta round-trip; the static check can't trace that call.
@@ -127,52 +198,16 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
             self.actual_name = self.template_name.lower().replace(" ", "_")  # nosemgrep: frappe-modifying-but-not-committing
 
         self.get_settings()
+        components, uses_named = self._build_components()
         data = {
             "name": self.actual_name,
             "language": self.language_code,
             "category": self.category,
-            "components": [],
+            "components": components,
         }
-
-        body = {
-            "type": "BODY",
-            "text": self.template,
-        }
-        if self.sample_values:
-            body.update({"example": {"body_text": [self.sample_values.split(",")]}})
-
-        data["components"].append(body)
-        if self.header_type:
-            data["components"].append(self.get_header())
-
-        # add footer
-        if self.footer:
-            data["components"].append({"type": "FOOTER", "text": self.footer})
-
-        # add buttons
-        if self.buttons:
-            button_block = {"type": "BUTTONS", "buttons": []}
-            for btn in self.buttons:
-                b = {"type": btn.button_type, "text": btn.button_label}
-
-                if btn.button_type == "Visit Website":
-                    b["type"] = "URL"
-                    b["url"] = btn.website_url
-                    if btn.url_type == "Dynamic" and btn.example_url:
-                        b["example"] = btn.example_url.split(",")
-                elif btn.button_type == "Call Phone":
-                    b["type"] = "PHONE_NUMBER"
-                    b["phone_number"] = btn.phone_number
-                elif btn.button_type == "Quick Reply":
-                    b["type"] = "QUICK_REPLY"
-                elif btn.button_type == "Multi-Product Message":
-                    b["type"] = "MPM"
-                elif btn.button_type == "Catalog":
-                    b["type"] = "CATALOG"
-
-                button_block["buttons"].append(b)
-
-            data["components"].append(button_block)
+        # Meta requires parameter_format=named when placeholders use named vars.
+        if uses_named:
+            data["parameter_format"] = "named"
 
         try:
             response = make_post_request(
@@ -194,43 +229,10 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
     def update_template(self):
         """Update template to meta."""
         self.get_settings()
-        data = {"components": []}
-
-        body = {
-            "type": "BODY",
-            "text": self.template,
-        }
-        if self.sample_values:
-            body.update({"example": {"body_text": [self.sample_values.split(",")]}})
-        data["components"].append(body)
-        if self.header_type:
-            data["components"].append(self.get_header())
-        if self.footer:
-            data["components"].append({"type": "FOOTER", "text": self.footer})
-        if self.buttons:
-            button_block = {"type": "BUTTONS", "buttons": []}
-            for btn in self.buttons:
-                b = {"type": btn.button_type, "text": btn.button_label}
-
-                if btn.button_type == "Visit Website":
-                    b["type"] = "URL"
-                    b["url"] = btn.website_url
-                    if btn.url_type == "Dynamic" and btn.example_url:
-                        b["example"] = btn.example_url.split(",")
-                elif btn.button_type == "Call Phone":
-                    b["type"] = "PHONE_NUMBER"
-                    b["phone_number"] = btn.phone_number
-                elif btn.button_type == "Quick Reply":
-                    b["type"] = "QUICK_REPLY"
-                elif btn.button_type == "Multi-Product Message":
-                    b["type"] = "MPM"
-                    # MPM buttons often require additional fields like catalog_id
-                elif btn.button_type == "Catalog":
-                    b["type"] = "CATALOG"
-
-                button_block["buttons"].append(b)
-
-            data["components"].append(button_block)
+        components, uses_named = self._build_components()
+        data = {"components": components}
+        if uses_named:
+            data["parameter_format"] = "named"
 
         try:
             # post template to meta for update
@@ -355,12 +357,16 @@ def fetch():
                     # update template text
                     elif component["type"] == "BODY":
                         doc.template = component["text"]
-                        if component.get("example"):
-    			            # Check if 'body_text' exists before trying to access it
-                            if component["example"].get("body_text"):
-                                doc.sample_values = ",".join(
-            	                    component["example"]["body_text"][0]
-                    	        )
+                        example = component.get("example") or {}
+                        # Positional templates expose body_text; named templates
+                        # expose body_text_named_params (Meta's newer format).
+                        if example.get("body_text"):
+                            doc.sample_values = ",".join(example["body_text"][0])
+                        elif example.get("body_text_named_params"):
+                            doc.sample_values = ",".join(
+                                p.get("example", "")
+                                for p in example["body_text_named_params"]
+                            )
 
                     # Update buttons
                     elif component["type"] == "BUTTONS":

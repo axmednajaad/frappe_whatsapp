@@ -6,7 +6,8 @@ from frappe import _, throw
 from frappe.model.document import Document
 from frappe.integrations.utils import make_post_request
 
-from frappe_whatsapp.utils import get_whatsapp_account, format_number
+from frappe_whatsapp.utils import format_number, get_whatsapp_account
+from frappe_whatsapp.utils.template_parameters import build_body_parameters
 
 class WhatsAppMessage(Document):
     def validate(self):
@@ -215,22 +216,22 @@ class WhatsAppMessage(Document):
 
             if self.body_param is not None:
                 params = list(json.loads(self.body_param).values())
-                for param in params:
-                    parameters.append({"type": "text", "text": param})
-                    template_parameters.append(param)
+                parameters = build_body_parameters(template.template, params)
+                template_parameters = params
             elif self.flags.custom_ref_doc:
                 custom_values = self.flags.custom_ref_doc
-                for field_name in field_names:
-                    value = custom_values.get(field_name.strip())
-                    parameters.append({"type": "text", "text": value})
-                    template_parameters.append(value)                    
-
+                field_values = [
+                    custom_values.get(field_name.strip()) for field_name in field_names
+                ]
+                parameters = build_body_parameters(template.template, field_values)
+                template_parameters = field_values
             else:
                 ref_doc = frappe.get_doc(self.reference_doctype, self.reference_name)
-                for field_name in field_names:
-                    value = ref_doc.get_formatted(field_name.strip())
-                    parameters.append({"type": "text", "text": value})
-                    template_parameters.append(value)
+                field_values = [
+                    ref_doc.get_formatted(field_name.strip()) for field_name in field_names
+                ]
+                parameters = build_body_parameters(template.template, field_values)
+                template_parameters = field_values
 
             self.template_parameters = json.dumps(template_parameters)
 

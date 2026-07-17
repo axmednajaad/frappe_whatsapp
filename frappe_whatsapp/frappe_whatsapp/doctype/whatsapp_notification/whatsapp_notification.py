@@ -11,6 +11,11 @@ from frappe.desk.form.utils import get_pdf_link
 from frappe.utils import add_to_date, nowdate, datetime
 
 from frappe_whatsapp.utils import get_whatsapp_account
+from frappe_whatsapp.utils.template_parameters import (
+	build_body_parameters,
+	build_text_parameter,
+	resolve_button_parameter_name,
+)
 
 
 class WhatsAppNotification(Document):
@@ -121,22 +126,21 @@ class WhatsAppNotification(Document):
                 }
             }
 
-            # Pass parameter values
+            # Pass parameter values (supports Meta positional {{1}} and named {{param}} formats)
             if self.fields:
-                parameters = []
+                field_values = []
                 for field in self.fields:
                     if isinstance(doc, Document):
-                        # get field with prettier value.
                         value = doc.get_formatted(field.field_name)
-                    else: 
+                    else:
                         value = doc_data[field.field_name]
-                        if isinstance(doc_data[field.field_name], (datetime.date, datetime.datetime)):
+                        if isinstance(
+                            doc_data[field.field_name], (datetime.date, datetime.datetime)
+                        ):
                             value = str(doc_data[field.field_name])
+                    field_values.append(value)
 
-                    parameters.append({
-                        "type": "text",
-                        "text": value
-                    })
+                parameters = build_body_parameters(template.template, field_values)
 
                 data['template']["components"] = [{
                     "type": "body",
@@ -214,13 +218,19 @@ class WhatsAppNotification(Document):
                 for idx, btn in enumerate(template.buttons):
                     if btn.button_type == "Visit Website" and btn.url_type == "Dynamic":
                         if button_fields:
+                            button_field = button_fields.pop(0).strip()
+                            button_value = doc.get(button_field)
+                            button_param = build_text_parameter(
+                                button_value,
+                                resolve_button_parameter_name(
+                                    btn.website_url, template.template
+                                ),
+                            )
                             data['template']['components'].append({
                                 "type": "button",
                                 "sub_type": "url",
                                 "index": str(idx),
-                                "parameters": [
-                                    {"type": "text", "text": doc.get(button_fields.pop(0))}
-                                ]
+                                "parameters": [button_param]
                             })
                     elif btn.button_type == "Multi-Product Message":
                         # MPM requires a catalog_id and product_retailer_ids
