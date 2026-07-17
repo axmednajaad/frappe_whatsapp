@@ -46,7 +46,7 @@ class TestWhatsAppNotification(IntegrationTestCase):
                 "actual_name": "test_notif_template",
                 "template": "Hello {{1}}, your order {{2}} is ready",
                 "sample_values": "John,ORD-001",
-                "category": "TRANSACTIONAL",
+                "category": "UTILITY",
                 "language": frappe.db.get_value("Language", {"language_code": "en"}) or "en",
                 "language_code": "en",
                 "whatsapp_account": "Test WA Notif Account",
@@ -216,6 +216,7 @@ class TestWhatsAppNotification(IntegrationTestCase):
             notification_name="Test Notif Condition",
             field_name="mobile_no",
             condition="doc.enabled == 1",
+            fields=["first_name", "name"],
         )
 
         # User with enabled=1 should trigger

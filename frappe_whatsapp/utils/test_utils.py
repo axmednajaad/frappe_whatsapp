@@ -122,7 +122,7 @@ class TestGetNotificationsMap(IntegrationTestCase):
                 "template_name": "test_utils_map_template",
                 "actual_name": "test_utils_map_template",
                 "template": "Hello",
-                "category": "TRANSACTIONAL",
+                "category": "UTILITY",
                 "language": frappe.db.get_value("Language", {"language_code": "en"}) or "en",
                 "language_code": "en",
                 "whatsapp_account": "Test Utils Map Account",

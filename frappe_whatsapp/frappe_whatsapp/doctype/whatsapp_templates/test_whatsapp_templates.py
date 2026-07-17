@@ -61,7 +61,7 @@ class TestWhatsAppTemplates(IntegrationTestCase):
             "template_name": template_name,
             "actual_name": template_name.lower().replace(" ", "_"),
             "template": kwargs.get("template", "Hello {{1}}"),
-            "category": kwargs.get("category", "TRANSACTIONAL"),
+            "category": kwargs.get("category", "UTILITY"),
             "language": kwargs.get("language", frappe.db.get_value("Language", {"language_code": "en"}) or "en"),
             "language_code": language_code,
             "whatsapp_account": kwargs.get("whatsapp_account", "Test WA Tmpl Account"),
@@ -71,6 +71,8 @@ class TestWhatsAppTemplates(IntegrationTestCase):
             "header": kwargs.get("header", ""),
             "footer": kwargs.get("footer", ""),
             "sample_values": kwargs.get("sample_values", ""),
+            "parameter_format": kwargs.get("parameter_format", "Number"),
+            "template_type": kwargs.get("template_type", "Default"),
         })
         doc.db_insert()
         frappe.db.commit()  # nosemgrep: frappe-manual-commit -- test fixture must be visible to later queries
@@ -87,6 +89,7 @@ class TestWhatsAppTemplates(IntegrationTestCase):
         mock_post.return_value = {}
         doc = self._make_template_without_hooks(template_name="test_tmpl_langcode")
         doc.language_code = ""
+        doc.sample_values = "World"
         doc.language = frappe.db.get_value("Language", {"language_code": "en"}) or "en"
         doc.validate()
         self.assertTrue(len(doc.language_code) > 0)
@@ -121,7 +124,7 @@ class TestWhatsAppTemplates(IntegrationTestCase):
             header="Order Update"
         )
         header = doc.get_header()
-        self.assertEqual(header["type"], "header")
+        self.assertEqual(header["type"], "HEADER")
         self.assertEqual(header["format"], "TEXT")
         self.assertEqual(header["text"], "Order Update")
 
@@ -160,7 +163,7 @@ class TestWhatsAppTemplates(IntegrationTestCase):
             "template_name": "test_tmpl_insert",
             "template": "Test body {{1}}",
             "sample_values": "World",
-            "category": "TRANSACTIONAL",
+            "category": "UTILITY",
             "language": frappe.db.get_value("Language", {"language_code": "en"}) or "en",
             "language_code": "en",
             "whatsapp_account": "Test WA Tmpl Account",
@@ -172,8 +175,59 @@ class TestWhatsAppTemplates(IntegrationTestCase):
         sent_data = json.loads(call_args.kwargs.get("data", call_args[1].get("data", "")))
         self.assertEqual(sent_data["name"], "test_tmpl_insert")
         self.assertEqual(sent_data["language"], "en")
-        self.assertEqual(sent_data["category"], "TRANSACTIONAL")
+        self.assertEqual(sent_data["category"], "UTILITY")
+        self.assertEqual(sent_data["parameter_format"], "positional")
         self.assertTrue(any(c["type"] == "BODY" for c in sent_data["components"]))
+
+    @patch("frappe_whatsapp.frappe_whatsapp.doctype.whatsapp_templates.whatsapp_templates.make_post_request")
+    def test_after_insert_creates_named_template_with_samples(self, mock_post):
+        mock_post.return_value = {
+            "id": "new_named_template_id",
+            "status": "PENDING",
+        }
+        doc = frappe.get_doc({
+            "doctype": "WhatsApp Templates",
+            "template_name": "test_tmpl_named",
+            "template": "Hello {{customer_name}}, reference {{reference_id}}",
+            "parameter_format": "Name",
+            "template_type": "Default",
+            "category": "UTILITY",
+            "language": frappe.db.get_value(
+                "Language", {"language_code": "en"}
+            ) or "en",
+            "language_code": "en",
+            "whatsapp_account": "Test WA Tmpl Account",
+            "variables": [
+                {
+                    "component": "BODY",
+                    "position": 1,
+                    "parameter_name": "customer_name",
+                    "sample_value": "Pablo",
+                },
+                {
+                    "component": "BODY",
+                    "position": 2,
+                    "parameter_name": "reference_id",
+                    "sample_value": "REF-001",
+                },
+            ],
+        })
+        doc.insert(ignore_permissions=True)
+
+        sent_data = json.loads(mock_post.call_args.kwargs["data"])
+        self.assertEqual(sent_data["parameter_format"], "named")
+        body = next(
+            component
+            for component in sent_data["components"]
+            if component["type"] == "BODY"
+        )
+        self.assertEqual(
+            body["example"]["body_text_named_params"],
+            [
+                {"param_name": "customer_name", "example": "Pablo"},
+                {"param_name": "reference_id", "example": "REF-001"},
+            ],
+        )
 
     @patch("frappe_whatsapp.frappe_whatsapp.doctype.whatsapp_templates.whatsapp_templates.make_post_request")
     def test_after_insert_with_footer(self, mock_post):
@@ -207,7 +261,7 @@ class TestWhatsAppTemplates(IntegrationTestCase):
             "doctype": "WhatsApp Templates",
             "template_name": "test_tmpl_buttons",
             "template": "Click below",
-            "category": "TRANSACTIONAL",
+            "category": "UTILITY",
             "language": frappe.db.get_value("Language", {"language_code": "en"}) or "en",
             "language_code": "en",
             "whatsapp_account": "Test WA Tmpl Account",
@@ -243,7 +297,7 @@ class TestWhatsAppTemplates(IntegrationTestCase):
             "doctype": "WhatsApp Templates",
             "template_name": "test_tmpl_trash",
             "template": "Delete me",
-            "category": "TRANSACTIONAL",
+            "category": "UTILITY",
             "language": frappe.db.get_value("Language", {"language_code": "en"}) or "en",
             "language_code": "en",
             "whatsapp_account": "Test WA Tmpl Account",
@@ -271,9 +325,14 @@ class TestWhatsAppTemplates(IntegrationTestCase):
                     "status": "APPROVED",
                     "language": "en",
                     "category": "UTILITY",
+                    "parameter_format": "POSITIONAL",
                     "id": "fetched_tmpl_id",
                     "components": [
-                        {"type": "BODY", "text": "Hello {{1}}, your order is ready"},
+                        {
+                            "type": "BODY",
+                            "text": "Hello {{1}}, your order is ready",
+                            "example": {"body_text": [["Pablo"]]},
+                        },
                         {"type": "FOOTER", "text": "Thank you"},
                     ]
                 }
@@ -282,7 +341,93 @@ class TestWhatsAppTemplates(IntegrationTestCase):
 
         from frappe_whatsapp.frappe_whatsapp.doctype.whatsapp_templates.whatsapp_templates import fetch
         result = fetch()
-        self.assertEqual(result, "Successfully fetched templates from meta")
+        self.assertIn("Successfully fetched", result)
+        fetch()
+        self.assertEqual(
+            frappe.db.count(
+                "WhatsApp Templates", {"id": "fetched_tmpl_id"}
+            ),
+            1,
+        )
+        template = frappe.get_doc(
+            "WhatsApp Templates", {"id": "fetched_tmpl_id"}
+        )
+        self.assertEqual(template.parameter_format, "Number")
+        self.assertEqual(template.variables[0].sample_value, "Pablo")
+
+    @patch("frappe.model.document.Document.get_password", return_value="mock_token")
+    @patch("frappe_whatsapp.frappe_whatsapp.doctype.whatsapp_templates.whatsapp_templates.make_request")
+    def test_fetch_named_samples_and_specialized_type(
+        self, mock_get, _mock_get_password
+    ):
+        mock_get.return_value = {
+            "data": [
+                {
+                    "name": "test_tmpl_named_fetched",
+                    "status": "APPROVED",
+                    "language": "en",
+                    "category": "UTILITY",
+                    "parameter_format": "NAMED",
+                    "id": "fetched_named_tmpl_id",
+                    "components": [
+                        {
+                            "type": "BODY",
+                            "text": "Hello {{customer_name}}",
+                            "example": {
+                                "body_text_named_params": [
+                                    {
+                                        "param_name": "customer_name",
+                                        "example": "Pablo",
+                                    }
+                                ]
+                            },
+                        },
+                        {"type": "CALL_PERMISSION_REQUEST"},
+                    ],
+                }
+            ]
+        }
+
+        from frappe_whatsapp.frappe_whatsapp.doctype.whatsapp_templates.whatsapp_templates import fetch
+
+        fetch()
+        template = frappe.get_doc(
+            "WhatsApp Templates", {"id": "fetched_named_tmpl_id"}
+        )
+        self.assertEqual(template.parameter_format, "Name")
+        self.assertEqual(template.template_type, "Call Permission Request")
+        self.assertEqual(template.meta_managed, 1)
+        self.assertEqual(template.variables[0].parameter_name, "customer_name")
+        self.assertEqual(template.variables[0].sample_value, "Pablo")
+
+    @patch("frappe_whatsapp.frappe_whatsapp.doctype.whatsapp_templates.whatsapp_templates.make_request")
+    def test_fetch_iterator_consumes_pagination(self, mock_get):
+        mock_get.side_effect = [
+            {
+                "data": [{"id": "page-one"}],
+                "paging": {
+                    "next": "https://graph.facebook.com/next-page",
+                    "cursors": {"after": "page-cursor"},
+                },
+            },
+            {"data": [{"id": "page-two"}]},
+        ]
+        from frappe_whatsapp.frappe_whatsapp.doctype.whatsapp_templates.whatsapp_templates import _iter_meta_templates
+
+        account = frappe._dict(
+            url="https://graph.facebook.com",
+            version="v25.0",
+            business_id="business-id",
+        )
+        templates = list(_iter_meta_templates(account, {"authorization": "Bearer token"}))
+        self.assertEqual(
+            [template["id"] for template in templates],
+            ["page-one", "page-two"],
+        )
+        self.assertIn(
+            "after=page-cursor",
+            mock_get.call_args_list[1].args[1],
+        )
 
     def test_upsert_doc_without_hooks(self):
         """Test upsert_doc_without_hooks inserts and updates correctly."""
@@ -296,3 +441,28 @@ class TestWhatsAppTemplates(IntegrationTestCase):
 
         doc.reload()
         self.assertEqual(doc.template, "Updated body text")
+
+    def test_migrate_legacy_category_and_variable_metadata(self):
+        doc = self._make_template_without_hooks(
+            template_name="test_tmpl_migration",
+            category="TRANSACTIONAL",
+            sample_values="Pablo,REF-001",
+        )
+        doc.template = "Hello {{1}}, reference {{2}}"
+        doc.field_names = "first_name,name"
+        doc.db_update()
+
+        from frappe_whatsapp.patches.migrate_template_metadata import execute
+
+        execute()
+        doc.reload()
+        self.assertEqual(doc.category, "UTILITY")
+        self.assertEqual(doc.parameter_format, "Number")
+        self.assertEqual(
+            [row.sample_value for row in doc.variables],
+            ["Pablo", "REF-001"],
+        )
+        self.assertEqual(
+            [row.field_name for row in doc.variables],
+            ["first_name", "name"],
+        )

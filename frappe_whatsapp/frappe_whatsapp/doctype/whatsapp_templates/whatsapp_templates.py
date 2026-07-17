@@ -3,24 +3,43 @@
 # Copyright (c) 2022, Shridhar Patil and contributors
 # For license information, please see license.txt
 import json
+from urllib.parse import urlencode
+
 import frappe
 import magic
 import requests
+from frappe import _
 from frappe.model.document import Document
 from frappe.integrations.utils import make_post_request, make_request
-from frappe.desk.form.utils import get_pdf_link
 
 from frappe_whatsapp.utils import get_whatsapp_account
-from frappe_whatsapp.utils.template_parameters import extract_named_parameter_names
+from frappe_whatsapp.utils.template_parameters import (
+	FORMAT_NAME,
+	build_component_example,
+	extract_named_parameter_names,
+	extract_positional_parameter_numbers,
+	from_api_parameter_format,
+	get_component_variables,
+	normalize_button_sample,
+	reconcile_variable_rows,
+	to_api_parameter_format,
+)
 
 class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-committing-other-method -- get_settings() sets self._token/_url/_version/_business_id/_app_id/_headers as in-memory scratch for the outbound Meta HTTP call; they are not DocType fields and must not be persisted
     """Create whatsapp template."""
 
     def validate(self):
+        if self.flags.skip_meta_sync:
+            return
+
         self.set_whatsapp_account()
         if not self.language_code or self.has_value_changed("language"):
             lang_code = frappe.db.get_value("Language", self.language) or "en"
             self.language_code = lang_code.replace("-", "_")
+
+        self.validate_template_type()
+        reconcile_variable_rows(self)
+        self.apply_legacy_variable_metadata()
 
         if self.header_type in ["IMAGE", "DOCUMENT"] and self.sample:
             self.get_session_id(self.sample)
@@ -29,12 +48,52 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
         if not self.is_new():
             self.update_template()
 
+    def apply_legacy_variable_metadata(self):
+        samples = [
+            value.strip() for value in (self.sample_values or "").split(",") if value
+        ]
+        field_names = [
+            value.strip() for value in (self.field_names or "").split(",") if value
+        ]
+        for index, variable in enumerate(
+            get_component_variables(self, "BODY")
+        ):
+            if not variable.sample_value and index < len(samples):
+                variable.sample_value = samples[index]
+            if not variable.field_name and index < len(field_names):
+                variable.field_name = field_names[index]
+
+    def validate_template_type(self):
+        allowed = {
+            "MARKETING": {"Default", "Catalog", "Call Permission Request"},
+            "UTILITY": {"Default", "Call Permission Request"},
+            "AUTHENTICATION": {"One-Time Passcode"},
+        }
+        if self.category not in allowed:
+            frappe.throw(_("Category must be MARKETING, UTILITY, or AUTHENTICATION."))
+        if self.template_type not in allowed[self.category]:
+            frappe.throw(
+                _("{0} is not valid for category {1}.").format(
+                    self.template_type, self.category
+                )
+            )
+        if self.template_type != "Default":
+            frappe.throw(
+                _(
+                    "{0} templates are synchronized from Meta as read-only in this phase."
+                ).format(self.template_type)
+            )
+
     def set_whatsapp_account(self):
         """Set whatsapp account to default if missing"""
         if not self.whatsapp_account:
             default_whatsapp_account = get_whatsapp_account()
             if not default_whatsapp_account:
-                throw(_("Please set a default outgoing WhatsApp Account or Select available WhatsApp Account"))
+                frappe.throw(
+                    _(
+                        "Please set a default outgoing WhatsApp Account or select an available WhatsApp Account"
+                    )
+                )
             else:
                 self.whatsapp_account = default_whatsapp_account.name
 
@@ -122,29 +181,18 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
 
 
     def _build_body_component(self):
-        """Build the BODY component, using Meta named-parameter example format
-        when the template body uses named placeholders like {{customer_name}}."""
-        named_params = extract_named_parameter_names(self.template)
         body = {
             "type": "BODY",
             "text": self.template,
         }
-        if self.sample_values:
-            samples = [s.strip() for s in self.sample_values.split(",")]
-            if named_params:
-                body["example"] = {
-                    "body_text_named_params": [
-                        {
-                            "param_name": name,
-                            "example": samples[idx] if idx < len(samples) else "",
-                        }
-                        for idx, name in enumerate(named_params)
-                    ]
-                }
-            else:
-                body["example"] = {"body_text": [samples]}
-
-        return body, bool(named_params)
+        example = build_component_example(
+            "BODY",
+            get_component_variables(self, "BODY"),
+            self.parameter_format,
+        )
+        if example:
+            body["example"] = example
+        return body
 
     def _build_button_component(self):
         """Build the BUTTONS component, or None when the template has no buttons."""
@@ -152,14 +200,21 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
             return None
 
         button_block = {"type": "BUTTONS", "buttons": []}
-        for btn in self.buttons:
+        for idx, btn in enumerate(self.buttons):
             b = {"type": btn.button_type, "text": btn.button_label}
 
             if btn.button_type == "Visit Website":
                 b["type"] = "URL"
                 b["url"] = btn.website_url
-                if btn.url_type == "Dynamic" and btn.example_url:
-                    b["example"] = btn.example_url.split(",")
+                if btn.url_type == "Dynamic":
+                    variables = get_component_variables(self, "BUTTON", idx)
+                    if len(variables) != 1 or not variables[0].sample_value:
+                        frappe.throw(
+                            _("Dynamic URL button {0} requires one sample value.").format(
+                                idx + 1
+                            )
+                        )
+                    b["example"] = [variables[0].sample_value]
             elif btn.button_type == "Call Phone":
                 b["type"] = "PHONE_NUMBER"
                 b["phone_number"] = btn.phone_number
@@ -175,9 +230,8 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
         return button_block
 
     def _build_components(self):
-        """Assemble Meta template components. Returns (components, uses_named)."""
-        body, uses_named = self._build_body_component()
-        components = [body]
+        """Assemble Meta template components."""
+        components = [self._build_body_component()]
 
         if self.header_type:
             components.append(self.get_header())
@@ -189,25 +243,26 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
         if button_block:
             components.append(button_block)
 
-        return components, uses_named
+        return components
 
     def after_insert(self):  # nosemgrep: frappe-modifying-but-not-committing -- self.actual_name/id/status are persisted via self.db_update() after the Meta round-trip; the static check can't trace through the API call
+        if self.flags.skip_meta_sync:
+            return
+
         # actual_name / id / status are persisted via self.db_update() below
         # after the Meta round-trip; the static check can't trace that call.
         if self.template_name:
             self.actual_name = self.template_name.lower().replace(" ", "_")  # nosemgrep: frappe-modifying-but-not-committing
 
         self.get_settings()
-        components, uses_named = self._build_components()
+        components = self._build_components()
         data = {
             "name": self.actual_name,
             "language": self.language_code,
             "category": self.category,
+            "parameter_format": to_api_parameter_format(self.parameter_format),
             "components": components,
         }
-        # Meta requires parameter_format=named when placeholders use named vars.
-        if uses_named:
-            data["parameter_format"] = "named"
 
         try:
             response = make_post_request(
@@ -229,10 +284,12 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
     def update_template(self):
         """Update template to meta."""
         self.get_settings()
-        components, uses_named = self._build_components()
-        data = {"components": components}
-        if uses_named:
-            data["parameter_format"] = "named"
+        components = self._build_components()
+        data = {
+            "category": self.category,
+            "components": components,
+            "parameter_format": to_api_parameter_format(self.parameter_format),
+        }
 
         try:
             # post template to meta for update
@@ -267,6 +324,10 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
         }
 
     def on_trash(self):
+        if self.meta_managed:
+            frappe.throw(
+                _("Delete this specialized template in Meta, then synchronize again.")
+            )
         self.get_settings()
         url = f"{self._url}/{self._version}/{self._business_id}/message_templates?name={self.actual_name}"
         try:
@@ -285,159 +346,313 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
 
     def get_header(self):
         """Get header format."""
-        header = {"type": "header", "format": self.header_type}
+        header = {"type": "HEADER", "format": self.header_type}
         if self.header_type == "TEXT":
             header["text"] = self.header
-            if self.sample:
-                samples = self.sample.split(", ")
-                header.update({"example": {"header_text": samples}})
+            variables = get_component_variables(self, "HEADER")
+            example = build_component_example(
+                "HEADER",
+                variables,
+                self.parameter_format,
+            )
+            if example:
+                header["example"] = example
+            elif self.sample:
+                names = extract_named_parameter_names(self.header)
+                header["example"] = (
+                    {
+                        "header_text_named_params": [
+                            {"param_name": names[0], "example": self.sample}
+                        ]
+                    }
+                    if names
+                    else {"header_text": [self.sample]}
+                )
         else:
-            pdf_link = ''
             if not self.sample:
-                key = frappe.get_doc(self.doctype, self.name).get_document_share_key()
-                link = get_pdf_link(self.doctype, self.name)
-                pdf_link = f"{frappe.utils.get_url()}{link}&key={key}"
+                frappe.throw(_("A media sample is required for {0} headers.").format(self.header_type))
             header.update({"example": {"header_handle": [self._media_id]}})
 
         return header
 
 @frappe.whitelist()
 def fetch():
-    """Fetch templates from meta."""
-    """Later improve this code to pass a whatsapp account remove the js funcation so that it is called from whatsapp account doctype """
-    whatsapp_accounts = frappe.get_all('WhatsApp Account', filters={'status': 'Active'}, fields=['name', 'token', 'url', 'version', 'business_id'])
+    """Synchronize all template pages from every active WhatsApp account."""
+    accounts = frappe.get_all(
+        "WhatsApp Account",
+        filters={"status": "Active"},
+        fields=["name", "url", "version", "business_id"],
+    )
+    synced = 0
 
-    for account in whatsapp_accounts:
-        # get credentials
-        token = frappe.get_doc("WhatsApp Account", account.name).get_password("token")
-        url = account.url
-        version = account.version
-        business_id = account.business_id
+    try:
+        for account in accounts:
+            token = frappe.get_doc("WhatsApp Account", account.name).get_password("token")
+            headers = {
+                "authorization": f"Bearer {token}",
+                "content-type": "application/json",
+            }
+            for template in _iter_meta_templates(account, headers):
+                _sync_meta_template(account, template)
+                synced += 1
+    except Exception as exc:
+        _throw_meta_error(exc)
 
-        headers = {"authorization": f"Bearer {token}", "content-type": "application/json"}
+    return _("Successfully fetched {0} template(s) from Meta").format(synced)
 
-        try:
-            response = make_request(
-                "GET",
-                f"{url}/{version}/{business_id}/message_templates",
-                headers=headers,
+
+def _iter_meta_templates(account, headers):
+    fields = "id,name,status,language,category,parameter_format,components"
+    endpoint = (
+        f"{account.url}/{account.version}/{account.business_id}/message_templates"
+    )
+    after = None
+
+    while True:
+        params = {"fields": fields, "limit": 100}
+        if after:
+            params["after"] = after
+        response = make_request(
+            "GET", f"{endpoint}?{urlencode(params)}", headers=headers
+        )
+        yield from response.get("data", [])
+        paging = response.get("paging") or {}
+        after = (paging.get("cursors") or {}).get("after")
+        if not paging.get("next") or not after:
+            break
+
+
+def _sync_meta_template(account, template):
+    doc = _find_meta_template(account.name, template)
+    is_new = doc.is_new()
+    components = template.get("components") or []
+    component_texts = []
+    for component in components:
+        component_texts.append(component.get("text", ""))
+        component_texts.extend(
+            button.get("url", "") for button in component.get("buttons", [])
+        )
+
+    doc.template_name = template["name"]
+    doc.actual_name = template["name"]
+    doc.status = template.get("status")
+    doc.language_code = template.get("language")
+    doc.language = _get_language(doc.language_code)
+    doc.category = template.get("category")
+    doc.id = template.get("id")
+    doc.whatsapp_account = account.name
+    doc.parameter_format = from_api_parameter_format(
+        template.get("parameter_format"), component_texts
+    )
+    doc.template_type = _detect_template_type(doc.category, components)
+    doc.meta_managed = int(doc.template_type != "Default")
+    doc.raw_components = json.dumps(components, indent=2)
+    doc.template = ""
+    doc.header_type = ""
+    doc.header = ""
+    doc.footer = ""
+    doc.set("buttons", [])
+    doc.set("variables", [])
+
+    _apply_meta_components(doc, components)
+    doc.flags.skip_meta_sync = True
+    if is_new:
+        doc.name = _make_local_template_name(doc)
+    doc.save(ignore_permissions=True)
+
+
+def _find_meta_template(account_name, template):
+    if template.get("id"):
+        name = frappe.db.exists("WhatsApp Templates", {"id": template["id"]})
+        if name:
+            return frappe.get_doc("WhatsApp Templates", name)
+
+    filters = {
+        "whatsapp_account": account_name,
+        "actual_name": template["name"],
+        "language_code": template.get("language"),
+    }
+    name = frappe.db.exists("WhatsApp Templates", filters)
+    return (
+        frappe.get_doc("WhatsApp Templates", name)
+        if name
+        else frappe.new_doc("WhatsApp Templates")
+    )
+
+
+def _make_local_template_name(doc):
+    base = f"{doc.template_name}-{doc.language_code}"
+    if not frappe.db.exists("WhatsApp Templates", base):
+        return base
+    account_slug = frappe.scrub(doc.whatsapp_account).replace("_", "-")
+    return f"{base}-{account_slug}"
+
+
+def _get_language(language_code):
+    normalized = (language_code or "").replace("_", "-")
+    return (
+        frappe.db.get_value("Language", {"language_code": normalized}, "name")
+        or frappe.db.get_value("Language", {"language_code": language_code}, "name")
+        or frappe.db.get_value("Language", {"language_code": "en"}, "name")
+    )
+
+
+def _detect_template_type(category, components):
+    component_types = {
+        component.get("type", "").upper() for component in components
+    }
+    button_types = {
+        button.get("type", "").upper()
+        for component in components
+        if component.get("type", "").upper() == "BUTTONS"
+        for button in component.get("buttons", [])
+    }
+    if category == "AUTHENTICATION" or "OTP" in button_types:
+        return "One-Time Passcode"
+    if "CALL_PERMISSION_REQUEST" in component_types:
+        return "Call Permission Request"
+    if "CATALOG" in button_types:
+        return "Catalog"
+    return "Default"
+
+
+def _apply_meta_components(doc, components):
+    type_map = {
+        "URL": "Visit Website",
+        "PHONE_NUMBER": "Call Phone",
+        "QUICK_REPLY": "Quick Reply",
+        "FLOW": "Flow",
+        "MPM": "Multi-Product Message",
+        "CATALOG": "Catalog",
+    }
+
+    for component in components:
+        component_type = component.get("type", "").upper()
+        if component_type == "BODY":
+            doc.template = component.get("text", "")
+            _append_example_variables(
+                doc,
+                "BODY",
+                component.get("text", ""),
+                component.get("example") or {},
             )
-
-            for template in response["data"]:
-                # set flag to insert or update
-                flags = 1
-                if frappe.db.exists("WhatsApp Templates", {"actual_name": template["name"]}):
-                    doc = frappe.get_doc("WhatsApp Templates", {"actual_name": template["name"]})
-                else:
-                    flags = 0
-                    doc = frappe.new_doc("WhatsApp Templates")
-                    doc.template_name = template["name"]
-                    doc.actual_name = template["name"]
-
-                doc.status = template["status"]
-                doc.language_code = template["language"]
-                doc.category = template["category"]
-                doc.id = template["id"]
-                doc.whatsapp_account = account.name
-
-                # update components
-                for component in template["components"]:
-
-                    # update header
-                    if component["type"] == "HEADER":
-                        doc.header_type = component["format"]
-
-                        # if format is text update sample text
-                        if component["format"] == "TEXT":
-                            doc.header = component["text"]
-                    # Update footer text
-                    elif component["type"] == "FOOTER":
-                        doc.footer = component["text"]
-
-                    # update template text
-                    elif component["type"] == "BODY":
-                        doc.template = component["text"]
-                        example = component.get("example") or {}
-                        # Positional templates expose body_text; named templates
-                        # expose body_text_named_params (Meta's newer format).
-                        if example.get("body_text"):
-                            doc.sample_values = ",".join(example["body_text"][0])
-                        elif example.get("body_text_named_params"):
-                            doc.sample_values = ",".join(
-                                p.get("example", "")
-                                for p in example["body_text_named_params"]
-                            )
-
-                    # Update buttons
-                    elif component["type"] == "BUTTONS":
-                        doc.set("buttons", [])
-                        frappe.db.delete("WhatsApp Button", {"parent": doc.name, "parenttype": "WhatsApp Templates"})
-                        typeMap = {
-                            "URL": "Visit Website",
-                            "PHONE_NUMBER": "Call Phone",
-                            "QUICK_REPLY": "Quick Reply",
-                            "FLOW": "Flow",
-                            "MPM": "Multi-Product Message",
-                            "CATALOG": "Catalog"
-                        }
-
-                        for i, button in enumerate(component.get("buttons", []), start=1):
-                            btn_type_raw = button.get("type")
-                            if btn_type_raw not in typeMap:
-                                frappe.log_error("WhatsApp Fetch Error", f"Unknown WhatsApp Button Type: {btn_type_raw}")
-                                continue
-
-                            btn = {}
-                            btn["button_type"] = typeMap[button["type"]]
-                            btn["button_label"] = button.get("text")
-                            btn["sequence"] = i
-
-                            if button["type"] == "URL":
-                                btn["website_url"] = button.get("url")
-                                if "{{" in btn["website_url"]:
-                                    btn["url_type"] = "Dynamic"
-                                else:
-                                    btn["url_type"] = "Static"
-
-                                if button.get("example"):
-                                    btn["example_url"] = ",".join(button["example"])
-                            elif button["type"] == "PHONE_NUMBER":
-                                btn["phone_number"] = button.get("phone_number")
-                            elif button["type"] == "FLOW":
-                                btn["flow"] = button.get("flow")
-
-                            doc.append("buttons", btn)
-
-                upsert_doc_without_hooks(doc, "WhatsApp Button", "buttons")
-
-            return "Successfully fetched templates from meta"
-
-        except Exception as e:
-            # Check if frappe.flags.integration_request is set and has a .json() method
-            if hasattr(frappe.flags.integration_request, 'json'):
-                try:
-                    res = frappe.flags.integration_request.json().get("error", {})
-                    error_message = res.get("error_user_msg", res.get("message"))
-                    frappe.throw(
-                        msg=error_message,
-                        title=res.get("error_user_title", "Error"),
+        elif component_type == "HEADER":
+            doc.header_type = component.get("format", "")
+            doc.header = component.get("text", "")
+            if doc.header_type == "TEXT":
+                _append_example_variables(
+                    doc,
+                    "HEADER",
+                    component.get("text", ""),
+                    component.get("example") or {},
+                )
+        elif component_type == "FOOTER":
+            doc.footer = component.get("text", "")
+        elif component_type == "BUTTONS":
+            for button_index, button in enumerate(component.get("buttons") or []):
+                raw_type = button.get("type", "").upper()
+                if raw_type not in type_map:
+                    continue
+                values = {
+                    "button_type": type_map[raw_type],
+                    "button_label": button.get("text") or type_map[raw_type],
+                }
+                if raw_type == "URL":
+                    values["website_url"] = button.get("url")
+                    values["url_type"] = (
+                        "Dynamic" if "{{" in (button.get("url") or "") else "Static"
                     )
-                except (json.JSONDecodeError, KeyError):
-                    # Handle cases where the response is not valid JSON or lacks the 'error' key
-                    frappe.throw(f"An unexpected error occurred while fetching templates: {e}")
-            else:
-                # Handle cases where frappe.flags.integration_request doesn't exist or isn't a proper response object
-                frappe.throw(f"An unexpected server error occurred: {e}")
+                    examples = button.get("example") or []
+                    values["example_url"] = ",".join(examples)
+                elif raw_type == "PHONE_NUMBER":
+                    values["phone_number"] = button.get("phone_number")
+                doc.append("buttons", values)
+                if raw_type == "URL" and values["url_type"] == "Dynamic":
+                    _append_button_variable(doc, button_index, button)
 
-def upsert_doc_without_hooks(doc, child_dt, child_field):
-    """Insert or update a parent document and its children without hooks."""
-    if frappe.db.exists(doc.doctype, doc.name):
-        doc.db_update()
-        frappe.db.delete(child_dt, {"parent": doc.name, "parenttype": doc.doctype})
-    else:
-        doc.db_insert()
-    for d in doc.get(child_field):
-        d.parent = doc.name
-        d.parenttype = doc.doctype
-        d.parentfield = child_field
-        d.db_insert()
+
+def _append_example_variables(doc, component, text, example):
+    if doc.parameter_format == FORMAT_NAME:
+        key = (
+            "body_text_named_params"
+            if component == "BODY"
+            else "header_text_named_params"
+        )
+        samples = {
+            item.get("param_name"): item.get("example")
+            for item in (example.get(key) or [])
+        }
+        for position, name in enumerate(
+            extract_named_parameter_names(text), start=1
+        ):
+            doc.append(
+                "variables",
+                {
+                    "component": component,
+                    "position": position,
+                    "parameter_name": name,
+                    "sample_value": samples.get(name),
+                },
+            )
+        return
+
+    key = "body_text" if component == "BODY" else "header_text"
+    values = example.get(key) or []
+    if component == "BODY" and values and isinstance(values[0], list):
+        values = values[0]
+    positions = extract_positional_parameter_numbers(text)
+    for position, _key in enumerate(positions, start=1):
+        doc.append(
+            "variables",
+            {
+                "component": component,
+                "position": position,
+                "parameter_name": str(position),
+                "sample_value": values[position - 1]
+                if position <= len(values)
+                else "",
+            },
+        )
+
+
+def _append_button_variable(doc, button_index, button):
+    names = extract_named_parameter_names(button.get("url"))
+    positions = extract_positional_parameter_numbers(button.get("url"))
+    examples = button.get("example") or []
+    keys = names or positions
+    for position, key in enumerate(keys, start=1):
+        raw_example = examples[position - 1] if position <= len(examples) else ""
+        doc.append(
+            "variables",
+            {
+                "component": "BUTTON",
+                "button_index": button_index,
+                "position": position,
+                "parameter_name": str(key),
+                "sample_value": normalize_button_sample(
+                    button.get("url"), raw_example
+                ),
+            },
+        )
+
+
+def _throw_meta_error(exc):
+    integration_request = getattr(frappe.flags, "integration_request", None)
+    if integration_request and hasattr(integration_request, "json"):
+        try:
+            error = integration_request.json().get("error", {})
+        except (ValueError, json.JSONDecodeError):
+            error = {}
+        if error:
+            frappe.throw(
+                error.get("error_user_msg") or error.get("message") or str(exc),
+                title=error.get("error_user_title") or _("Meta API Error"),
+            )
+    frappe.throw(_("Unable to fetch templates from Meta: {0}").format(exc))
+
+
+def upsert_doc_without_hooks(doc, child_dt=None, child_field=None):
+    """Backward-compatible wrapper used by older integrations and tests."""
+    doc.flags.skip_meta_sync = True
+    doc.save(ignore_permissions=True)
+    

@@ -12,9 +12,8 @@ from frappe.utils import add_to_date, nowdate, datetime
 
 from frappe_whatsapp.utils import get_whatsapp_account
 from frappe_whatsapp.utils.template_parameters import (
-	build_body_parameters,
-	build_text_parameter,
-	resolve_button_parameter_name,
+	build_parameters,
+	get_component_variables,
 )
 
 
@@ -54,10 +53,7 @@ class WhatsAppNotification(Document):
             self.condition, get_safe_globals(), dict(doc=self)
         )
 
-        template = frappe.db.get_value(
-            "WhatsApp Templates", self.template,
-            fieldname='*'
-        )
+        template = frappe.get_doc("WhatsApp Templates", self.template)
 
         if template and template.language_code:
             if self.get("_contact_list"):
@@ -75,6 +71,12 @@ class WhatsAppNotification(Document):
 
     def send_simple_template(self, template):
         """ send simple template without a doc to get field data """
+        if template.get("variables"):
+            frappe.throw(
+                _(
+                    "Contact-list sends require a template without variables because no source document is available."
+                )
+            )
         for contact in self._contact_list:
             data = {
                 "messaging_product": "whatsapp",
@@ -126,8 +128,8 @@ class WhatsAppNotification(Document):
                 }
             }
 
-            # Pass parameter values (supports Meta positional {{1}} and named {{param}} formats)
-            if self.fields:
+            body_variables = get_component_variables(template, "BODY")
+            if body_variables:
                 field_values = []
                 for field in self.fields:
                     if isinstance(doc, Document):
@@ -140,12 +142,31 @@ class WhatsAppNotification(Document):
                             value = str(doc_data[field.field_name])
                     field_values.append(value)
 
-                parameters = build_body_parameters(template.template, field_values)
+                parameters = build_parameters(
+                    template, "BODY", field_values
+                )
 
-                data['template']["components"] = [{
+                data['template']["components"].append({
                     "type": "body",
                     "parameters": parameters
-                }]
+                })
+
+            header_variables = get_component_variables(template, "HEADER")
+            if header_variables and not (
+                self.attach_document_print or self.custom_attachment
+            ):
+                header_values = [
+                    self._get_variable_value(doc, doc_data, variable.field_name)
+                    for variable in header_variables
+                ]
+                data["template"]["components"].append(
+                    {
+                        "type": "header",
+                        "parameters": build_parameters(
+                            template, "HEADER", header_values
+                        ),
+                    }
+                )
 
             if self.attach_document_print:
                 key = doc.get_document_share_key()  # noqa
@@ -220,17 +241,18 @@ class WhatsAppNotification(Document):
                         if button_fields:
                             button_field = button_fields.pop(0).strip()
                             button_value = doc.get(button_field)
-                            button_param = build_text_parameter(
-                                button_value,
-                                resolve_button_parameter_name(
-                                    btn.website_url, template.template
-                                ),
+                            button_params = build_parameters(
+                                template,
+                                "BUTTON",
+                                [button_value],
+                                button_index=idx,
+                                encode_url=True,
                             )
                             data['template']['components'].append({
                                 "type": "button",
                                 "sub_type": "url",
                                 "index": str(idx),
-                                "parameters": [button_param]
+                                "parameters": button_params
                             })
                     elif btn.button_type == "Multi-Product Message":
                         # MPM requires a catalog_id and product_retailer_ids
@@ -256,6 +278,15 @@ class WhatsAppNotification(Document):
 
 
             self.notify(data, doc_data)
+
+    def _get_variable_value(self, doc, doc_data, field_name):
+        if not field_name:
+            frappe.throw(
+                _("A source Field Name is required for each header variable.")
+            )
+        if isinstance(doc, Document):
+            return doc.get_formatted(field_name)
+        return doc_data.get(field_name)
 
     def notify(self, data, doc_data=None):
         """Notify."""
@@ -286,7 +317,12 @@ class WhatsAppNotification(Document):
 
             parameters = None
             if data["template"]["components"]:
-                parameters = [param["text"] for param in data["template"]["components"][0]["parameters"]]
+                parameters = [
+                    param["text"]
+                    for component in data["template"]["components"]
+                    for param in component.get("parameters", [])
+                    if "text" in param
+                ]
                 parameters = frappe.json.dumps(parameters, default=str)
 
             new_doc = {

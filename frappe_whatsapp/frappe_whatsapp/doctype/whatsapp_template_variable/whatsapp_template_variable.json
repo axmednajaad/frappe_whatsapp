@@ -1,0 +1,71 @@
+{
+ "actions": [],
+ "creation": "2026-07-17 15:20:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "component",
+  "button_index",
+  "position",
+  "parameter_name",
+  "sample_value",
+  "field_name"
+ ],
+ "fields": [
+  {
+   "fieldname": "component",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Component",
+   "options": "BODY\nHEADER\nBUTTON",
+   "reqd": 1
+  },
+  {
+   "depends_on": "eval:doc.component == \"BUTTON\"",
+   "fieldname": "button_index",
+   "fieldtype": "Int",
+   "label": "Button Index"
+  },
+  {
+   "fieldname": "position",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Position",
+   "reqd": 1
+  },
+  {
+   "fieldname": "parameter_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Parameter",
+   "description": "Named variable (customer_name) or Number index (1)"
+  },
+  {
+   "fieldname": "sample_value",
+   "fieldtype": "Small Text",
+   "in_list_view": 1,
+   "label": "Sample Value"
+  },
+  {
+   "description": "Optional source field used when sending directly from a reference document",
+   "fieldname": "field_name",
+   "fieldtype": "Data",
+   "label": "Field Name"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-07-17 15:20:00.000000",
+ "modified_by": "Administrator",
+ "module": "Frappe Whatsapp",
+ "name": "WhatsApp Template Variable",
+ "owner": "Administrator",
+ "permissions": [],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

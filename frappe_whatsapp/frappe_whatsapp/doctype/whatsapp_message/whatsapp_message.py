@@ -7,7 +7,11 @@ from frappe.model.document import Document
 from frappe.integrations.utils import make_post_request
 
 from frappe_whatsapp.utils import format_number, get_whatsapp_account
-from frappe_whatsapp.utils.template_parameters import build_body_parameters
+from frappe_whatsapp.utils.template_parameters import (
+	FORMAT_NAME,
+	build_parameters,
+	get_component_variables,
+)
 
 class WhatsAppMessage(Document):
     def validate(self):
@@ -209,37 +213,56 @@ class WhatsAppMessage(Document):
             },
         }
 
-        parameters = []
         template_parameters = []
-        if template.sample_values:
-            field_names = template.field_names.split(",") if template.field_names else template.sample_values.split(",")
-
+        body_variables = get_component_variables(template, "BODY")
+        if body_variables:
             if self.body_param is not None:
-                params = list(json.loads(self.body_param).values())
-                parameters = build_body_parameters(template.template, params)
-                template_parameters = params
+                supplied = json.loads(self.body_param)
+                if isinstance(supplied, dict) and template.parameter_format == FORMAT_NAME:
+                    template_parameters = [
+                        supplied.get(variable.parameter_name)
+                        for variable in body_variables
+                    ]
+                else:
+                    template_parameters = (
+                        list(supplied.values())
+                        if isinstance(supplied, dict)
+                        else list(supplied)
+                    )
             elif self.flags.custom_ref_doc:
                 custom_values = self.flags.custom_ref_doc
-                field_values = [
-                    custom_values.get(field_name.strip()) for field_name in field_names
+                template_parameters = [
+                    custom_values.get(variable.field_name)
+                    for variable in body_variables
                 ]
-                parameters = build_body_parameters(template.template, field_values)
-                template_parameters = field_values
             else:
                 ref_doc = frappe.get_doc(self.reference_doctype, self.reference_name)
-                field_values = [
-                    ref_doc.get_formatted(field_name.strip()) for field_name in field_names
+                template_parameters = [
+                    ref_doc.get_formatted(variable.field_name)
+                    for variable in body_variables
                 ]
-                parameters = build_body_parameters(template.template, field_values)
-                template_parameters = field_values
 
             self.template_parameters = json.dumps(template_parameters)
+            data["template"]["components"].append({
+                "type": "body",
+                "parameters": build_parameters(
+                    template, "BODY", template_parameters
+                ),
+            })
 
-        # Always add the body component, even if parameters list is empty
-        data["template"]["components"].append({
-            "type": "body",
-            "parameters": parameters,
-        })
+        header_variables = get_component_variables(template, "HEADER")
+        if header_variables:
+            header_values = self._get_template_variable_values(
+                header_variables
+            )
+            data["template"]["components"].append(
+                {
+                    "type": "header",
+                    "parameters": build_parameters(
+                        template, "HEADER", header_values
+                    ),
+                }
+            )
 
         if template.header_type:
             if self.attach:
@@ -325,19 +348,43 @@ class WhatsAppMessage(Document):
                         "parameters": [{"type": "payload", "payload": btn.button_label}]
                     })
                 elif btn.button_type == "Visit Website" and btn.url_type == "Dynamic":
-                    ref_doc = frappe.get_doc(self.reference_doctype, self.reference_name)
-                    url = ref_doc.get_formatted(btn.website_url)
+                    variables = get_component_variables(
+                        template, "BUTTON", idx
+                    )
+                    values = self._get_template_variable_values(variables)
                     button_parameters.append({
                         "type": "button",
                         "sub_type": "url",
                         "index": current_idx,
-                        "parameters": [{"type": "text", "text": url}]
+                        "parameters": build_parameters(
+                            template,
+                            "BUTTON",
+                            values,
+                            button_index=idx,
+                            encode_url=True,
+                        ),
                     })
 
             if button_parameters:
                 data['template']['components'].extend(button_parameters)
 
         self.notify(data)
+
+    def _get_template_variable_values(self, variables):
+        if any(not variable.field_name for variable in variables):
+            frappe.throw(
+                _("A source Field Name is required for each template variable.")
+            )
+        if self.flags.custom_ref_doc:
+            return [
+                self.flags.custom_ref_doc.get(variable.field_name)
+                for variable in variables
+            ]
+        ref_doc = frappe.get_doc(self.reference_doctype, self.reference_name)
+        return [
+            ref_doc.get_formatted(variable.field_name)
+            for variable in variables
+        ]
 
     def notify(self, data):
         """Notify."""
