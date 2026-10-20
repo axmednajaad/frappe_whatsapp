@@ -295,13 +295,23 @@ def update_template_status(data):
 
 def update_message_status(data):
 	"""Update message status."""
-	id = data['statuses'][0]['id']
-	status = data['statuses'][0]['status']
-	conversation = data['statuses'][0].get('conversation', {}).get('id')
-	name = frappe.db.get_value("WhatsApp Message", filters={"message_id": id})
+	message_id = data["statuses"][0]["id"]
+	status = data["statuses"][0]["status"]
+	conversation = data["statuses"][0].get("conversation", {}).get("id")
+	name = frappe.db.get_value("WhatsApp Message", filters={"message_id": message_id})
 
-	doc = frappe.get_doc("WhatsApp Message", name)
-	doc.status = status
+	if not name:
+		return
+
+	values = {"status": status}
 	if conversation:
-		doc.conversation_id = conversation
-	doc.save(ignore_permissions=True)
+		values["conversation_id"] = conversation
+
+	# Use db.set_value to avoid TimestampMismatchError when concurrent
+	# webhook status updates arrive milliseconds apart.
+	frappe.db.set_value(
+		"WhatsApp Message",
+		name,
+		values,
+		update_modified=False,
+	)

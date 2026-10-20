@@ -16,6 +16,7 @@ class WhatsAppFlow(Document):
     def validate(self):
         """Validate flow configuration."""
         self.validate_screens()
+        self.validate_conditional_fields()
 
     def validate_screens(self):
         """Ensure at least one screen exists and has valid configuration."""
@@ -35,6 +36,68 @@ class WhatsAppFlow(Document):
 
         if terminal_count == 0:
             frappe.throw(_("At least one screen must be marked as terminal"))
+
+    def validate_conditional_fields(self):
+        """Meta requires Footer in both If branches when Footer is used inside If."""
+        by_screen_condition = {}
+        for field in self.fields or []:
+            if not field.enabled:
+                continue
+            condition = (field.visible_condition or "").strip()
+            if not condition:
+                continue
+            key = (field.screen, condition)
+            by_screen_condition.setdefault(key, {"Then": [], "Else": []})
+            branch = field.condition_branch or "Then"
+            if branch not in ("Then", "Else"):
+                branch = "Then"
+            by_screen_condition[key][branch].append(field)
+
+        for (screen_id, condition), branches in by_screen_condition.items():
+            then_has_footer = any(f.field_type == "Footer" for f in branches["Then"])
+            else_has_footer = any(f.field_type == "Footer" for f in branches["Else"])
+            if then_has_footer != else_has_footer:
+                frappe.throw(
+                    _(
+                        "Screen {0}: condition must include a Footer in both Then and Else "
+                        "branches (Meta If rule). Condition: {1}"
+                    ).format(screen_id, condition)
+                )
+            if then_has_footer and else_has_footer:
+                outer_footer = any(
+                    f.enabled
+                    and f.screen == screen_id
+                    and f.field_type == "Footer"
+                    and not (f.visible_condition or "").strip()
+                    for f in (self.fields or [])
+                )
+                if outer_footer:
+                    frappe.throw(
+                        _(
+                            "Screen {0}: cannot mix an unconditional Footer with Footers "
+                            "inside an If condition."
+                        ).format(screen_id)
+                    )
+
+            # TextArea must not use max-chars (Meta rejection)
+            for branch_fields in branches.values():
+                for field in branch_fields:
+                    if field.field_type == "TextArea" and field.max_chars:
+                        frappe.throw(
+                            _(
+                                "Field {0}: Meta does not allow max-chars on TextArea. "
+                                "Clear Max Characters."
+                            ).format(field.field_name)
+                        )
+
+        for field in self.fields or []:
+            if field.field_type == "TextArea" and field.max_chars:
+                frappe.throw(
+                    _(
+                        "Field {0}: Meta does not allow max-chars on TextArea. "
+                        "Clear Max Characters."
+                    ).format(field.field_name)
+                )
 
     def generate_flow_json(self):
         """Generate WhatsApp Flow JSON from DocType configuration.
@@ -118,24 +181,116 @@ class WhatsAppFlow(Document):
         return screen_data
 
     def build_screen_fields(self, screen):
-        """Build field components for a screen."""
+        """Build field components for a screen, including Meta If / Switch grouping."""
         children = []
         has_footer = False
+        unconditional_fields = []
+        conditional_order = []
+        conditional_groups = {}
+        switch_order = []
+        switch_groups = {}
 
-        # Get fields that belong to this screen from the fields table
         for field in self.fields:
             if field.screen != screen.screen_id:
                 continue
             if not field.enabled:
                 continue
 
+            condition = (field.visible_condition or "").strip()
+            switch_on = (getattr(field, "switch_on", None) or "").strip()
+            switch_case = (getattr(field, "switch_case", None) or "").strip()
+
+            if condition:
+                if condition not in conditional_groups:
+                    conditional_groups[condition] = {"Then": [], "Else": []}
+                    conditional_order.append(condition)
+                branch = field.condition_branch or "Then"
+                if branch not in ("Then", "Else"):
+                    branch = "Then"
+                conditional_groups[condition][branch].append(field)
+            elif switch_on:
+                if not switch_case:
+                    frappe.throw(
+                        _("Field {0}: Switch Case is required when Switch On is set.").format(
+                            field.field_name
+                        )
+                    )
+                if switch_on not in switch_groups:
+                    switch_groups[switch_on] = {}
+                    switch_order.append(switch_on)
+                for case_key in [c.strip() for c in switch_case.split(",") if c.strip()]:
+                    switch_groups[switch_on].setdefault(case_key, []).append(field)
+            else:
+                unconditional_fields.append(field)
+
+        for field in unconditional_fields:
             component = self.build_field_component(field, screen)
             if component:
                 children.append(component)
                 if field.field_type == "Footer":
                     has_footer = True
 
-        # Always add a Footer if not present (required by WhatsApp)
+        for condition in conditional_order:
+            branches = conditional_groups[condition]
+            then_components = []
+            else_components = []
+
+            for field in branches["Then"]:
+                component = self.build_field_component(field, screen)
+                if component:
+                    then_components.append(component)
+                    if field.field_type == "Footer":
+                        has_footer = True
+
+            for field in branches["Else"]:
+                component = self.build_field_component(field, screen)
+                if component:
+                    else_components.append(component)
+                    if field.field_type == "Footer":
+                        has_footer = True
+
+            if not then_components and not else_components:
+                continue
+
+            if_component = {
+                "type": "If",
+                "condition": condition,
+                "then": then_components or [{"type": "TextCaption", "text": " "}],
+            }
+            if else_components or any(c.get("type") == "Footer" for c in then_components):
+                if_component["else"] = else_components
+            children.append(if_component)
+
+        for switch_on in switch_order:
+            cases = {}
+            for case_key, fields in switch_groups[switch_on].items():
+                case_components = []
+                for field in fields:
+                    component = self.build_field_component(field, screen)
+                    if component:
+                        case_components.append(component)
+                        if field.field_type == "Footer":
+                            has_footer = True
+                cases[case_key] = case_components
+
+            # Meta: Footer in one case requires Footer in every case
+            cases_with_footer = {
+                key for key, comps in cases.items() if any(c.get("type") == "Footer" for c in comps)
+            }
+            if cases_with_footer and cases_with_footer != set(cases.keys()):
+                missing = ", ".join(sorted(set(cases.keys()) - cases_with_footer))
+                frappe.throw(
+                    _(
+                        "Screen {0}: Switch on {1} has Footer in some cases but not in: {2}"
+                    ).format(screen.screen_id, switch_on, missing)
+                )
+
+            children.append({
+                "type": "Switch",
+                "value": switch_on,
+                "cases": cases,
+            })
+
         if not has_footer:
             footer_action = self.build_footer_action(None, screen)
             children.append({
@@ -203,11 +358,12 @@ class WhatsAppFlow(Document):
         if field.init_value:
             component["init-value"] = field.init_value
 
-        # Text input specific
+        # TextInput / TextArea validation
         if field_type in ["TextInput", "TextArea"]:
             if field.min_chars:
                 component["min-chars"] = field.min_chars
-            if field.max_chars:
+            # Meta allows max-chars on TextInput only
+            if field_type == "TextInput" and field.max_chars:
                 component["max-chars"] = field.max_chars
             if field.error_message:
                 component["error-message"] = field.error_message
@@ -228,59 +384,97 @@ class WhatsAppFlow(Document):
 
     def build_footer_action(self, field, screen):
         """Build the action for a footer button."""
+        payload = self.build_payload(screen, footer_field=field)
+
         if screen.terminal:
-            # Complete the flow
             return {
                 "name": "complete",
-                "payload": self.build_payload(screen)
+                "payload": payload
             }
-        else:
-            # Navigate to next screen
-            next_screen = self.get_next_screen(screen)
-            if next_screen:
-                return {
-                    "name": "navigate",
-                    "next": {
-                        "type": "screen",
-                        "name": next_screen.screen_id
-                    },
-                    "payload": self.build_payload(screen)
-                }
-            else:
-                return {
-                    "name": "complete",
-                    "payload": self.build_payload(screen)
-                }
 
-    def build_payload(self, screen):
-        """Build payload with all field values up to and including this screen."""
+        next_screen = self.get_next_screen(screen)
+        if next_screen:
+            return {
+                "name": "navigate",
+                "next": {
+                    "type": "screen",
+                    "name": next_screen.screen_id
+                },
+                "payload": payload
+            }
+
+        return {
+            "name": "complete",
+            "payload": payload
+        }
+
+    def build_payload(self, screen, footer_field=None):
+        """Build payload with field values up to and including this screen.
+
+        If footer_field.payload_fields is set (comma-separated names), only those
+        current-screen form fields are included (plus prior-screen data refs).
+        """
         payload = {}
+        allowed_current = None
+        if footer_field and getattr(footer_field, "payload_fields", None):
+            allowed_current = {
+                name.strip()
+                for name in str(footer_field.payload_fields).split(",")
+                if name.strip()
+            }
 
-        # Include all fields from previous screens (passed via data) as data references
-        found_current = False
+        non_input_types = {
+            "TextHeading", "TextSubheading", "TextBody",
+            "TextCaption", "Image", "EmbeddedLink", "Footer"
+        }
+
         for s in self.screens:
             if s.screen_id == screen.screen_id:
-                found_current = True
-                # For current screen, use form references
                 for field in self.fields:
                     if field.screen != s.screen_id:
                         continue
-                    if field.enabled and field.field_type not in [
-                        "TextHeading", "TextSubheading", "TextBody",
-                        "TextCaption", "Image", "EmbeddedLink", "Footer"
-                    ]:
-                        payload[field.field_name] = "${form." + field.field_name + "}"
+                    if not field.enabled or field.field_type in non_input_types:
+                        continue
+                    if allowed_current is not None and field.field_name not in allowed_current:
+                        continue
+                    # Skip fields that only appear in Else/Then other branch when
+                    # footer specifies payload — already handled by allowed_current.
+                    # When auto payload: skip fields that are conditional-only on
+                    # the opposite branch of this footer.
+                    if (
+                        allowed_current is None
+                        and (field.visible_condition or "").strip()
+                        and footer_field
+                        and (footer_field.visible_condition or "").strip()
+                        and field.visible_condition.strip() == footer_field.visible_condition.strip()
+                        and (field.condition_branch or "Then") != (footer_field.condition_branch or "Then")
+                    ):
+                        continue
+                    if (
+                        allowed_current is None
+                        and (field.visible_condition or "").strip()
+                        and footer_field
+                        and (footer_field.visible_condition or "").strip()
+                        and field.visible_condition.strip() != footer_field.visible_condition.strip()
+                    ):
+                        continue
+                    if (
+                        allowed_current is None
+                        and (field.visible_condition or "").strip()
+                        and footer_field
+                        and not (footer_field.visible_condition or "").strip()
+                    ):
+                        # Unconditional footer should not reference conditional-only fields
+                        continue
+                    payload[field.field_name] = "${form." + field.field_name + "}"
                 break
-            else:
-                # For previous screens, use data references (already passed in)
-                for field in self.fields:
-                    if field.screen != s.screen_id:
-                        continue
-                    if field.enabled and field.field_type not in [
-                        "TextHeading", "TextSubheading", "TextBody",
-                        "TextCaption", "Image", "EmbeddedLink", "Footer"
-                    ]:
-                        payload[field.field_name] = "${data." + field.field_name + "}"
+
+            for field in self.fields:
+                if field.screen != s.screen_id:
+                    continue
+                if not field.enabled or field.field_type in non_input_types:
+                    continue
+                payload[field.field_name] = "${data." + field.field_name + "}"
 
         return payload
 
@@ -307,8 +501,13 @@ class WhatsAppFlow(Document):
             return []
 
     @frappe.whitelist()
-    def create_on_whatsapp(self):
-        """Create the flow on WhatsApp Business API."""
+    def create_on_whatsapp(self, meta_flow_name: str | None = None):
+        """Create the flow on WhatsApp Business API.
+
+        Args:
+                meta_flow_name: Optional unique name for Meta WABA.
+                        Defaults to this document's flow_name.
+        """
         if self.flow_id:
             frappe.throw(_("Flow already exists on WhatsApp. Use update instead."))
 
@@ -317,9 +516,12 @@ class WhatsAppFlow(Document):
 
         # Create the flow
         url = f"{account.url}/{account.version}/{account.business_id}/flows"
+        create_name = (meta_flow_name or self.flow_name or "").strip()
+        if not create_name:
+            frappe.throw(_("Flow name is required"))
 
         payload = {
-            "name": self.flow_name,
+            "name": create_name,
             "categories": [self.category]
         }
 
@@ -329,8 +531,21 @@ class WhatsAppFlow(Document):
         }
 
         try:
-            response = make_post_request(url, headers=headers, data=json.dumps(payload))
-            self.flow_id = response.get("id")
+            import requests
+            response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+            data = {}
+            try:
+                data = response.json()
+            except Exception:
+                data = {"raw": response.text}
+
+            if response.status_code != 200:
+                err = data.get("error") or {}
+                error_msg = err.get("error_user_msg") or err.get("message") or response.text
+                frappe.throw(_("Failed to create flow: {0}").format(error_msg))
+
+            self.flow_id = data.get("id")
+            self.status = "Draft"
             self.save()
 
             # Upload the flow JSON
@@ -338,6 +553,8 @@ class WhatsAppFlow(Document):
 
             frappe.msgprint(_("Flow created successfully on WhatsApp"))
 
+        except frappe.ValidationError:
+            raise
         except Exception as e:
             frappe.throw(_("Failed to create flow: {0}").format(str(e)))
 
@@ -367,19 +584,41 @@ class WhatsAppFlow(Document):
 
         try:
             import requests
-            response = requests.post(url, headers=headers, files=files)
+            response = requests.post(url, headers=headers, files=files, timeout=60)
+
+            data = {}
+            try:
+                data = response.json()
+            except Exception:
+                data = {"raw": response.text}
 
             if response.status_code != 200:
-                error_data = response.json()
-                error_msg = error_data.get("error", {}).get("message", response.text)
-                # Also check for validation errors
-                error_details = error_data.get("error", {}).get("error_user_msg", "")
-                if error_details:
-                    error_msg = f"{error_msg} - {error_details}"
+                err = data.get("error") or {}
+                error_msg = err.get("error_user_msg") or err.get("message") or response.text
+                validation_errors = data.get("validation_errors") or []
+                if validation_errors:
+                    details = "; ".join(
+                        ve.get("message") or str(ve) for ve in validation_errors[:5]
+                    )
+                    error_msg = f"{error_msg} — {details}"
                 frappe.throw(_("Failed to upload flow JSON: {0}").format(error_msg))
+
+            # Meta may return 200 with validation_errors that block publish
+            validation_errors = data.get("validation_errors") or []
+            if validation_errors:
+                details = "; ".join(
+                    ve.get("message") or str(ve) for ve in validation_errors[:5]
+                )
+                frappe.throw(_("Flow JSON has validation errors: {0}").format(details))
+
+            # Updating a published flow returns it to Draft
+            if self.status == "Published":
+                self.db_set("status", "Draft", update_modified=True)
 
             frappe.msgprint(_("Flow JSON uploaded successfully"))
 
+        except frappe.ValidationError:
+            raise
         except requests.exceptions.RequestException as e:
             frappe.throw(_("Failed to upload flow JSON: {0}").format(str(e)))
 
@@ -404,11 +643,17 @@ class WhatsAppFlow(Document):
 
         try:
             import requests
-            response = requests.post(url, headers=headers)
+            response = requests.post(url, headers=headers, timeout=60)
+
+            data = {}
+            try:
+                data = response.json()
+            except Exception:
+                data = {"raw": response.text}
 
             if response.status_code != 200:
-                error_data = response.json()
-                error_msg = error_data.get("error", {}).get("message", response.text)
+                err = data.get("error") or {}
+                error_msg = err.get("error_user_msg") or err.get("message") or response.text
                 frappe.throw(_("Failed to publish flow: {0}").format(error_msg))
 
             self.status = "Published"
@@ -416,8 +661,79 @@ class WhatsAppFlow(Document):
 
             frappe.msgprint(_("Flow published successfully"))
 
+        except frappe.ValidationError:
+            raise
         except Exception as e:
             frappe.throw(_("Failed to publish flow: {0}").format(str(e)))
+
+    @frappe.whitelist()
+    def update_and_publish(self):
+        """Upload current Flow JSON to the existing Meta flow_id and publish.
+
+        Preferred for editable Flows (returns Published → Draft → Published).
+        """
+        if not self.flow_id:
+            frappe.throw(_("Flow must be created on WhatsApp first"))
+
+        self.upload_flow_json()
+        self.reload()
+        if self.status != "Published":
+            self.publish_flow()
+        return {"flow_id": self.flow_id, "status": self.status}
+
+    @frappe.whitelist()
+    def recreate_and_publish(self):
+        """Update in place when possible; otherwise create a uniquely named Meta flow.
+
+        Causes of previous failures:
+        - Deprecate 400 when already deprecated
+        - Create 400 when flow name is not unique in the WABA
+        """
+        # 1) Prefer in-place update (keeps same flow_id for sending)
+        if self.flow_id:
+            try:
+                return self.update_and_publish()
+            except Exception:
+                frappe.log_error(
+                    title=f"WhatsApp Flow in-place update failed: {self.name}",
+                    message=frappe.get_traceback(),
+                )
+
+        # 2) Soft-deprecate old id (ignore already-deprecated)
+        old_flow_id = self.flow_id
+        if old_flow_id:
+            try:
+                self.deprecate_flow()
+            except Exception as e:
+                msg = str(e)
+                if "already deprecated" not in msg.lower() and "139003" not in msg:
+                    frappe.log_error(
+                        title=f"WhatsApp Flow deprecate failed: {self.name}",
+                        message=frappe.get_traceback(),
+                    )
+
+        # 3) Create with a unique Meta name (WABA names stay reserved after deprecate)
+        unique_meta_name = f"{self.flow_name} {frappe.utils.now_datetime().strftime('%Y%m%d%H%M%S')}"
+        self.flow_id = None
+        self.status = "Draft"
+        self.save(ignore_permissions=True)
+
+        self.create_on_whatsapp(meta_flow_name=unique_meta_name)
+        self.reload()
+        if self.status != "Published":
+            self.publish_flow()
+
+        frappe.msgprint(
+            _("Flow published. Meta name: {0}. Flow ID: {1}").format(
+                unique_meta_name, self.flow_id
+            )
+        )
+        return {
+            "flow_id": self.flow_id,
+            "status": self.status,
+            "meta_flow_name": unique_meta_name,
+            "previous_flow_id": old_flow_id,
+        }
 
     @frappe.whitelist()
     def deprecate_flow(self):
@@ -436,12 +752,32 @@ class WhatsAppFlow(Document):
         }
 
         try:
-            response = make_post_request(url, headers=headers)
+            import requests
+            response = requests.post(url, headers=headers, timeout=60)
+            data = {}
+            try:
+                data = response.json()
+            except Exception:
+                data = {"raw": response.text}
+
+            if response.status_code != 200:
+                err = data.get("error") or {}
+                error_msg = err.get("error_user_msg") or err.get("message") or response.text
+                # Already deprecated is a no-op success
+                if "already deprecated" in str(error_msg).lower() or err.get("error_subcode") == 4016008:
+                    self.status = "Deprecated"
+                    self.save()
+                    frappe.msgprint(_("Flow was already deprecated on WhatsApp"))
+                    return
+                frappe.throw(_("Failed to deprecate flow: {0}").format(error_msg))
+
             self.status = "Deprecated"
             self.save()
 
             frappe.msgprint(_("Flow deprecated successfully"))
 
+        except frappe.ValidationError:
+            raise
         except Exception as e:
             frappe.throw(_("Failed to deprecate flow: {0}").format(str(e)))
 

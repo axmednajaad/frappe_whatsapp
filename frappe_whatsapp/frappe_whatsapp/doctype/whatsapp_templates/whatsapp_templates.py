@@ -224,6 +224,18 @@ class WhatsAppTemplates(Document):  # nosemgrep: frappe-modifying-but-not-commit
                 b["type"] = "MPM"
             elif btn.button_type == "Catalog":
                 b["type"] = "CATALOG"
+            elif btn.button_type == "Flow":
+                b["type"] = "FLOW"
+                flow_id = (btn.flow_id or "").strip()
+                if not flow_id:
+                    frappe.throw(
+                        _("Flow button {0} requires Flow ID.").format(idx + 1)
+                    )
+                b["flow_id"] = flow_id
+                b["flow_action"] = "navigate"
+                navigate_screen = (btn.navigate_screen or "").strip()
+                if navigate_screen:
+                    b["navigate_screen"] = navigate_screen
 
             button_block["buttons"].append(b)
 
@@ -566,6 +578,13 @@ def _apply_meta_components(doc, components):
                     values["example_url"] = ",".join(examples)
                 elif raw_type == "PHONE_NUMBER":
                     values["phone_number"] = button.get("phone_number")
+                elif raw_type == "FLOW":
+                    values["flow_id"] = str(
+                        button.get("flow_id") or button.get("flowId") or ""
+                    )
+                    values["navigate_screen"] = button.get("navigate_screen") or button.get(
+                        "navigateScreen"
+                    )
                 doc.append("buttons", values)
                 if raw_type == "URL" and values["url_type"] == "Dynamic":
                     _append_button_variable(doc, button_index, button)

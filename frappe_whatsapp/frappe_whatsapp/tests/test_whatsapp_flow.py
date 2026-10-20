@@ -314,6 +314,116 @@ class TestWhatsAppFlow(FrappeTestCase):
         self.assertIn("version", flow_json)
         self.assertIn("screens", flow_json)
 
+    def test_conditional_switch_groups_fields(self):
+        """Meta Switch: comment for Average/Poor, footer in every case."""
+        screens = [{"screen_id": "FEEDBACK", "screen_title": "Rate", "terminal": 1}]
+        switch_on = "${form.rating}"
+        fields = [
+            {
+                "screen": "FEEDBACK",
+                "field_name": "rating",
+                "field_type": "RadioButtonsGroup",
+                "label": "Rating",
+                "required": 1,
+                "enabled": 1,
+                "options": json.dumps(
+                    [
+                        {"id": "Excellent", "title": "Excellent"},
+                        {"id": "Average", "title": "Average"},
+                        {"id": "Poor", "title": "Poor"},
+                        {"id": "Good", "title": "Good"},
+                    ]
+                ),
+            },
+            {
+                "screen": "FEEDBACK",
+                "field_name": "comment_average",
+                "field_type": "TextArea",
+                "label": "Comment",
+                "required": 1,
+                "enabled": 1,
+                "switch_on": switch_on,
+                "switch_case": "Average",
+            },
+            {
+                "screen": "FEEDBACK",
+                "field_name": "footer_neg",
+                "field_type": "Footer",
+                "label": "Submit",
+                "enabled": 1,
+                "switch_on": switch_on,
+                "switch_case": "Average",
+                "payload_fields": "rating,comment_average",
+            },
+            {
+                "screen": "FEEDBACK",
+                "field_name": "comment_poor",
+                "field_type": "TextArea",
+                "label": "Comment",
+                "required": 1,
+                "enabled": 1,
+                "switch_on": switch_on,
+                "switch_case": "Poor",
+            },
+            {
+                "screen": "FEEDBACK",
+                "field_name": "footer_poor",
+                "field_type": "Footer",
+                "label": "Submit",
+                "enabled": 1,
+                "switch_on": switch_on,
+                "switch_case": "Poor",
+                "payload_fields": "rating,comment_poor",
+            },
+            {
+                "screen": "FEEDBACK",
+                "field_name": "footer_pos",
+                "field_type": "Footer",
+                "label": "Submit",
+                "enabled": 1,
+                "switch_on": switch_on,
+                "switch_case": "Excellent,Good",
+                "payload_fields": "rating",
+            },
+        ]
+
+        flow = self.create_test_flow("Test Conditional Switch", screens, fields)
+        flow_json = json.loads(flow.flow_json)
+        children = flow_json["screens"][0]["layout"]["children"]
+
+        switches = [c for c in children if c.get("type") == "Switch"]
+        self.assertEqual(len(switches), 1)
+        switch = switches[0]
+        self.assertEqual(switch["value"], switch_on)
+        self.assertIn("Average", switch["cases"])
+        self.assertIn("Poor", switch["cases"])
+        self.assertIn("Excellent", switch["cases"])
+        self.assertIn("Good", switch["cases"])
+
+        avg_types = [c["type"] for c in switch["cases"]["Average"]]
+        exc_types = [c["type"] for c in switch["cases"]["Excellent"]]
+        self.assertIn("TextArea", avg_types)
+        self.assertIn("Footer", avg_types)
+        self.assertEqual(exc_types, ["Footer"])
+        self.assertNotIn("TextArea", exc_types)
+        self.assertEqual(switch["cases"]["Average"][0]["name"], "comment_average")
+        self.assertEqual(switch["cases"]["Poor"][0]["name"], "comment_poor")
+
+    def test_textarea_rejects_max_chars(self):
+        screens = [{"screen_id": "S1", "screen_title": "S1", "terminal": 1}]
+        fields = [
+            {
+                "screen": "S1",
+                "field_name": "note",
+                "field_type": "TextArea",
+                "label": "Note",
+                "enabled": 1,
+                "max_chars": 100,
+            }
+        ]
+        with self.assertRaises(frappe.ValidationError):
+            self.create_test_flow("Test TextArea Max Chars", screens, fields)
+
 
 class TestWhatsAppFlowMessage(FrappeTestCase):
     """Test cases for sending WhatsApp Flow messages."""

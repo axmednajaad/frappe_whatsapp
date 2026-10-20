@@ -275,6 +275,23 @@ class WhatsAppNotification(Document):
                                     {"type": "action", "action": doc.get(button_fields.pop(0))}
                                 ]
                             })
+                    elif btn.button_type == "Flow":
+                        # Meta requires a FLOW button component when the template
+                        # includes a Flow button (#131009 without it).
+                        flow_token = None
+                        if button_fields:
+                            flow_token = doc.get(button_fields.pop(0).strip())
+                        if not flow_token:
+                            flow_token = getattr(doc, "name", None) or "unused"
+                        data["template"]["components"].append({
+                            "type": "button",
+                            "sub_type": "flow",
+                            "index": str(idx),
+                            "parameters": [{
+                                "type": "action",
+                                "action": {"flow_token": str(flow_token)},
+                            }],
+                        })
 
 
             self.notify(data, doc_data)

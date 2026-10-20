@@ -5,7 +5,7 @@ frappe.ui.form.on("WhatsApp Flow", {
     refresh(frm) {
         // Import from Meta button (for new docs or docs without flow_id)
         if (frm.is_new() || !frm.doc.flow_id) {
-            frm.add_custom_button(__("Import from Meta"), function() {
+            frm.add_custom_button(__("Import from Meta"), function () {
                 show_import_dialog(frm);
             }, __("Actions"));
         }
@@ -14,13 +14,13 @@ frappe.ui.form.on("WhatsApp Flow", {
         if (!frm.is_new()) {
             // Sync from Meta button (if flow_id exists)
             if (frm.doc.flow_id) {
-                frm.add_custom_button(__("Sync from Meta"), function() {
+                frm.add_custom_button(__("Sync from Meta"), function () {
                     frm.call({
                         method: "sync_from_whatsapp",
                         doc: frm.doc,
                         freeze: true,
                         freeze_message: __("Syncing flow from Meta..."),
-                        callback: function(r) {
+                        callback: function (r) {
                             frm.reload_doc();
                         }
                     });
@@ -29,43 +29,79 @@ frappe.ui.form.on("WhatsApp Flow", {
 
             // Create on WhatsApp button
             if (!frm.doc.flow_id) {
-                frm.add_custom_button(__("Create on WhatsApp"), function() {
+                frm.add_custom_button(__("Create on WhatsApp"), function () {
                     frm.call({
                         method: "create_on_whatsapp",
                         doc: frm.doc,
                         freeze: true,
                         freeze_message: __("Creating flow on WhatsApp..."),
-                        callback: function(r) {
+                        callback: function (r) {
                             frm.reload_doc();
                         }
                     });
                 }, __("Actions"));
             }
 
-            // Upload JSON button (if flow exists but not published)
+            // Upload JSON button (draft, or republish path for published)
             if (frm.doc.flow_id && frm.doc.status === "Draft") {
-                frm.add_custom_button(__("Upload Flow JSON"), function() {
+                frm.add_custom_button(__("Upload Flow JSON"), function () {
                     frm.call({
                         method: "upload_flow_json",
                         doc: frm.doc,
                         freeze: true,
                         freeze_message: __("Uploading flow JSON..."),
-                        callback: function(r) {
+                        callback: function (r) {
                             frm.reload_doc();
                         }
                     });
                 }, __("Actions"));
 
-                frm.add_custom_button(__("Publish"), function() {
+                frm.add_custom_button(__("Publish"), function () {
                     frappe.confirm(
                         __("Are you sure you want to publish this flow? Published flows cannot be edited."),
-                        function() {
+                        function () {
                             frm.call({
                                 method: "publish_flow",
                                 doc: frm.doc,
                                 freeze: true,
                                 freeze_message: __("Publishing flow..."),
-                                callback: function(r) {
+                                callback: function (r) {
+                                    frm.reload_doc();
+                                }
+                            });
+                        }
+                    );
+                }, __("Actions"));
+            }
+
+            // Published: prefer in-place update; recreate uses unique Meta name if needed
+            if (frm.doc.flow_id && ["Published", "Draft", "Deprecated"].includes(frm.doc.status)) {
+                if (frm.doc.status === "Published" || frm.doc.status === "Draft") {
+                    frm.add_custom_button(__("Update & Publish JSON"), function () {
+                        frm.call({
+                            method: "update_and_publish",
+                            doc: frm.doc,
+                            freeze: true,
+                            freeze_message: __("Uploading and publishing flow..."),
+                            callback: function (r) {
+                                frm.reload_doc();
+                            }
+                        });
+                    }, __("Actions"));
+                }
+
+                frm.add_custom_button(__("Recreate & Publish Updated JSON"), function () {
+                    frappe.confirm(
+                        __(
+                            "Tries in-place update first. If Meta blocks it, creates a new uniquely named Flow and publishes it. Continue?"
+                        ),
+                        function () {
+                            frm.call({
+                                method: "recreate_and_publish",
+                                doc: frm.doc,
+                                freeze: true,
+                                freeze_message: __("Updating flow on WhatsApp..."),
+                                callback: function (r) {
                                     frm.reload_doc();
                                 }
                             });
@@ -76,16 +112,16 @@ frappe.ui.form.on("WhatsApp Flow", {
 
             // Deprecate button (if published)
             if (frm.doc.flow_id && frm.doc.status === "Published") {
-                frm.add_custom_button(__("Deprecate"), function() {
+                frm.add_custom_button(__("Deprecate"), function () {
                     frappe.confirm(
                         __("Are you sure you want to deprecate this flow?"),
-                        function() {
+                        function () {
                             frm.call({
                                 method: "deprecate_flow",
                                 doc: frm.doc,
                                 freeze: true,
                                 freeze_message: __("Deprecating flow..."),
-                                callback: function(r) {
+                                callback: function (r) {
                                     frm.reload_doc();
                                 }
                             });
@@ -96,7 +132,7 @@ frappe.ui.form.on("WhatsApp Flow", {
 
             // Preview, status, and test buttons (if flow exists)
             if (frm.doc.flow_id) {
-                frm.add_custom_button(__("Send Test"), function() {
+                frm.add_custom_button(__("Send Test"), function () {
                     frappe.prompt([
                         {
                             fieldname: "phone_number",
@@ -112,33 +148,33 @@ frappe.ui.form.on("WhatsApp Flow", {
                             default: "Please fill out the form below"
                         }
                     ],
-                    function(values) {
-                        frm.call({
-                            method: "send_test",
-                            doc: frm.doc,
-                            args: {
-                                phone_number: values.phone_number,
-                                message: values.message
-                            },
-                            freeze: true,
-                            freeze_message: __("Sending test flow..."),
-                            callback: function(r) {
-                                // Success message shown by server
-                            }
-                        });
-                    },
-                    __("Send Test Flow"),
-                    __("Send")
+                        function (values) {
+                            frm.call({
+                                method: "send_test",
+                                doc: frm.doc,
+                                args: {
+                                    phone_number: values.phone_number,
+                                    message: values.message
+                                },
+                                freeze: true,
+                                freeze_message: __("Sending test flow..."),
+                                callback: function (r) {
+                                    // Success message shown by server
+                                }
+                            });
+                        },
+                        __("Send Test Flow"),
+                        __("Send")
                     );
                 }, __("Actions"));
 
-                frm.add_custom_button(__("Check Status"), function() {
+                frm.add_custom_button(__("Check Status"), function () {
                     frm.call({
                         method: "get_flow_status",
                         doc: frm.doc,
                         freeze: true,
                         freeze_message: __("Checking flow status..."),
-                        callback: function(r) {
+                        callback: function (r) {
                             frm.reload_doc();
                             if (r.message && r.message.validation_errors && r.message.validation_errors.length > 0) {
                                 console.log("Validation errors:", r.message.validation_errors);
@@ -147,13 +183,13 @@ frappe.ui.form.on("WhatsApp Flow", {
                     });
                 }, __("Actions"));
 
-                frm.add_custom_button(__("Get Preview URL"), function() {
+                frm.add_custom_button(__("Get Preview URL"), function () {
                     frm.call({
                         method: "get_flow_preview",
                         doc: frm.doc,
                         freeze: true,
                         freeze_message: __("Getting preview URL..."),
-                        callback: function(r) {
+                        callback: function (r) {
                             frm.reload_doc();
                             if (r.message) {
                                 frappe.msgprint({
@@ -167,16 +203,16 @@ frappe.ui.form.on("WhatsApp Flow", {
                 }, __("Actions"));
 
                 // Delete from WhatsApp button
-                frm.add_custom_button(__("Delete from WhatsApp"), function() {
+                frm.add_custom_button(__("Delete from WhatsApp"), function () {
                     frappe.confirm(
                         __("Are you sure you want to delete this flow from WhatsApp? This cannot be undone."),
-                        function() {
+                        function () {
                             frm.call({
                                 method: "delete_from_whatsapp",
                                 doc: frm.doc,
                                 freeze: true,
                                 freeze_message: __("Deleting flow..."),
-                                callback: function(r) {
+                                callback: function (r) {
                                     frm.reload_doc();
                                 }
                             });
@@ -214,7 +250,7 @@ function show_import_dialog(frm) {
             }
         ],
         primary_action_label: __("Fetch Flows"),
-        primary_action: function(values) {
+        primary_action: function (values) {
             account_dialog.hide();
             fetch_and_show_flows(values.whatsapp_account, frm);
         }
@@ -231,7 +267,7 @@ function fetch_and_show_flows(whatsapp_account, frm) {
         },
         freeze: true,
         freeze_message: __("Fetching flows from Meta..."),
-        callback: function(r) {
+        callback: function (r) {
             if (r.message && r.message.length > 0) {
                 show_flows_selection_dialog(r.message, whatsapp_account, frm);
             } else {
@@ -298,7 +334,7 @@ function show_flows_selection_dialog(flows, whatsapp_account, frm) {
     dialog.show();
 
     // Attach click handlers to import buttons
-    dialog.$wrapper.find(".import-flow-btn").on("click", function() {
+    dialog.$wrapper.find(".import-flow-btn").on("click", function () {
         let flow_id = $(this).data("flow-id");
         let flow_name = $(this).data("flow-name");
 
@@ -318,7 +354,7 @@ function import_flow(whatsapp_account, flow_id, flow_name, frm) {
         },
         freeze: true,
         freeze_message: __("Importing flow..."),
-        callback: function(r) {
+        callback: function (r) {
             if (r.message) {
                 frappe.set_route("Form", "WhatsApp Flow", r.message);
             }

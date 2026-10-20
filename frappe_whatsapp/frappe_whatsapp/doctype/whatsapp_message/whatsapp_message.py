@@ -364,6 +364,23 @@ class WhatsAppMessage(Document):
                             encode_url=True,
                         ),
                     })
+                elif btn.button_type == "Flow":
+                    # Required by Meta for templates with a FLOW button (#131009).
+                    flow_token = (
+                        getattr(self, "flow_token", None)
+                        or self.reference_name
+                        or self.name
+                        or "unused"
+                    )
+                    button_parameters.append({
+                        "type": "button",
+                        "sub_type": "flow",
+                        "index": current_idx,
+                        "parameters": [{
+                            "type": "action",
+                            "action": {"flow_token": str(flow_token)},
+                        }],
+                    })
 
             if button_parameters:
                 data['template']['components'].extend(button_parameters)
